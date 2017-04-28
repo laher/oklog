@@ -34,7 +34,7 @@ type Forwarder struct {
 // Messages will never be dropped.
 func NewBlockingForwarder(urls []*url.URL, prefix string) *Forwarder {
 	textScannerFunc := func(r io.Reader) textScanner {
-		s := bufio.NewScanner(r)
+		s := &bufioScanner{bufio.NewScanner(r)}
 		return s
 	}
 	return &Forwarder{
@@ -52,7 +52,7 @@ func NewBlockingForwarder(urls []*url.URL, prefix string) *Forwarder {
 // bufferSize refers to the maximum number of log messages (rather than e.g. bytes) in the buffer
 func NewBufferedForwarder(urls []*url.URL, prefix string, bufferSize int) *Forwarder {
 	textScannerFunc := func(r io.Reader) textScanner {
-		rb := NewBufferedScanner(NewRingBufferBCH(bufferSize))
+		rb := NewBufferedScanner(NewRingBuffer(bufferSize))
 		go rb.Consume(r)
 		return rb
 	}
@@ -144,10 +144,9 @@ func (f *Forwarder) Forward(r io.Reader) error {
 			continue
 		}
 
-		ok := s.Scan()
+		ok, record, err := s.Next()
 		for ok {
-			// We enter the loop wanting to write s.Text() to the conn.
-			record := s.Text()
+			// We enter the loop wanting to write record to the conn.
 			if n, err := fmt.Fprintf(conn, "%s%s\n", f.Prefix, record); err != nil {
 				f.Disconnects.Inc()
 				level.Warn(logger)
@@ -163,14 +162,24 @@ func (f *Forwarder) Forward(r io.Reader) error {
 			backoff = 0 // reset the backoff on a successful write
 			f.ForwardBytes.Add(float64(len(record)) + 1)
 			f.ForwardRecords.Inc()
-			ok = s.Scan()
+			ok, record, err = s.Next()
 		}
 		if !ok {
-			level.Info(logger).Log("stdin", "exhausted", "due_to", s.Err())
+			level.Info(logger).Log("stdin", "exhausted", "due_to", err)
 			return nil
 		}
 	}
 
+}
+
+// bufioScanner implements a simpler API for our use-case
+type bufioScanner struct {
+	*bufio.Scanner
+}
+
+func (bs *bufioScanner) Next() (bool, string, error) {
+	t := bs.Scanner.Scan()
+	return t, bs.Scanner.Text(), bs.Scanner.Err()
 }
 
 func exponential(d time.Duration) time.Duration {
@@ -188,12 +197,10 @@ func exponential(d time.Duration) time.Duration {
 	return d
 }
 
-// textScanner models bufio.Scanner, so we can provide
-// an alternate ringbuffered implementation.
+// textScanner encapsulates bufio.Scanner in a single method, so we can provide
+// a straightforward alternate implementation.
 type textScanner interface {
-	Scan() bool
-	Text() string
-	Err() error
+	Next() (bool, string, error)
 }
 
 // Count or add several values to a given counter. This could be a prometheus Counter
